@@ -1,196 +1,213 @@
 # ytm-purge
 
-A small command-line utility for performing artist-level expungement of a personal YouTube Music library: every saved song, liked track, saved album, and artist subscription touching a set of unwanted artist channels is removed in a single run, with a hand-marked CSV as the curation interface.
+Command-line helper to **clean up your YouTube Music library by artist**: export every artist that appears in your library (saved songs, likes, saved albums, subscriptions), **delete the rows** for anyone you do **not** want to keep, then one command removes everyone else still in the library from your account (matching tracks, likes, saved albums, and artist subscriptions).
 
-The project is deliberately scoped: it solves library hygiene, not recommendation hygiene. Watch-history pruning and the *Don't recommend channel* signal remain manual tasks (see [Non-goals](#non-goals)).
+You build a **keep list** by editing the CSV; the tool does not guess from language, country, or metadata — only who remains in the file.
 
-## Motivation
+**Scope:** it fixes **library** contents. It does **not** fix recommendations by itself (watch history and “don’t recommend” still behave as in the official app). See [What this tool does *not* do](#what-this-tool-does-not-do).
 
-YouTube Music exposes no built-in mechanism to batch-delete a library by artist. The official client supports only per-track or per-album operations through its overflow menu, which is intractable for libraries above a few dozen items.
+---
 
-This tool exports every artist that touches your library into a single CSV; you mark rows to remove; the script applies those choices. *Which* artists to remove is entirely up to you — the program does not classify or filter by language, origin, or metadata.
+## Install
 
-## Approach
+You need [uv](https://docs.astral.sh/uv/) and a copy of this repository.
 
-The workflow is a three-phase pipeline with the human in the loop between phases:
-
-```
-┌────────────┐    ┌────────────┐    ┌────────────┐
-│ inventory  │──▶│  edit CSV  │──▶│   delete   │
-│  (script)  │    │  (human)   │    │  (script)  │
-└────────────┘    └────────────┘    └────────────┘
-   YT Music ──▶ artists.csv ──▶ artists.csv* ──▶ YT Music
+```bash
+cd /path/to/ytm_purge
+uv sync
 ```
 
-1. **Inventory.** The script enumerates every artist channel that appears anywhere across the user's library (saved songs, liked songs, saved albums, subscriptions), aggregates per-source counts, and writes one row per artist to a CSV. Rows are sorted by total footprint so heavy-tail artists surface first.
+That creates a local virtual environment and installs dependencies. Day-to-day you only need the commands below.
 
-2. **Edit.** The user opens the CSV in any spreadsheet or text editor, sets the `delete` column to `1` on each artist to be expunged, and saves. No other column needs to be touched.
+---
 
-3. **Delete.** The script reads the marked CSV, re-fetches current library state, and for every track whose artist set intersects the target set:
-   - removes the song from the library via its `feedbackTokens.remove` token (batched);
-   - removes the like via `rate_song(..., 'INDIFFERENT')`;
-   - removes the saved album via `rate_playlist(..., 'INDIFFERENT')`;
-   - unsubscribes from the artist channel via `unsubscribe_artists`.
+## One-time setup: sign in and create `browser.json`
 
-   A `--dry-run` flag prints the plan and a sample of affected tracks without mutating state. Live runs require an interactive `y/N` confirmation.
+The tool talks to YouTube Music the same way your browser does, using a small **`browser.json`** file produced by **`ytmusicapi`**. That file contains session cookies — **treat it like a password**. Do not email it, do not commit it to git (this repo already lists it in `.gitignore`).
 
-## Prerequisites
+### 1. Log in in the browser
 
-- [uv](https://docs.astral.sh/uv/) (manages Python and dependencies).
-- Clone or copy this repo, then from the project root:
+Open **[music.youtube.com](https://music.youtube.com)** and sign in with the Google account whose library you want to manage. Stay on that account for the next steps.
 
-  ```bash
-  uv sync --all-groups
-  ```
+### 2. Open developer tools → Network
 
-  Production use only needs `uv sync` (installs `ytmusicapi` and the script’s runtime deps).
+- **Firefox:** `F12` or `Ctrl+Shift+I` (Windows/Linux) / `Cmd+Option+I` (macOS), then open the **Network** tab.
+- **Chrome / Edge:** same shortcuts, then **Network**.
 
-- A browser-cookie authentication file for `ytmusicapi`. Generate it once with:
+Make sure recording is on (you should see new lines appearing after a reload).
 
-  ```bash
-  uv run ytmusicapi browser
-  ```
+### 3. Reload YouTube Music
 
-  Follow the prompts. This produces `browser.json` in the working directory by default; pass a different path with `--auth` on `inventory` / `delete` if you keep the file elsewhere. See the [ytmusicapi setup docs](https://ytmusicapi.readthedocs.io/en/stable/usage/setup.html).
+With the **Network** tab open, reload the page (`Ctrl+R` / `Cmd+R`, or `Ctrl+Shift+R` for a hard reload). You should see many requests appear. If the list stays empty, reload again while **Network** is focused.
 
-  OAuth-based authentication is also supported by `ytmusicapi` but has been intermittent following recent changes to Google's OAuth client restrictions; browser-cookie auth is the recommended path at the time of writing.
+### 4. Choose a good request
 
-## Usage
+Avoid random **beacon** or **`/api/stats/qoe`** lines — those are often analytics and make a bad copy.
 
-### 1. Inventory
+Prefer a request like one of these:
+
+- **`POST`** to **`music.youtube.com`** whose path looks like **`/youtubei/v1/...`** (often named **browse**, **player**, **next**, etc.), or
+- **`POST`** to **`youtubei.googleapis.com`**.
+
+Click a request that returned status **200** (or similar success).
+
+### 5. Copy **request headers** (plain text, not JSON)
+
+You need the **raw HTTP request headers**, not a JSON tree of the URL.
+
+- **Firefox:** right-click the request → **Copy** → **Copy Request Headers**.
+- **Chrome / Edge:** right-click the request → **Copy** → **Copy request headers**.
+
+The pasted block should look like lines such as:
+
+```http
+Host: music.youtube.com
+User-Agent: ...
+Cookie: ...long string...
+X-Goog-Authuser: 0
+...
+```
+
+Important:
+
+- A **`Cookie:`** line must be present (very long is normal).
+- **`X-Goog-Authuser`** (or similar) should appear — `ytmusicapi` expects it.
+
+Some browsers **omit** an **`Authorization:`** line when copying. Current `ytm-purge` builds work around that; if you see **`Authorization: ... SAPISIDHASH ...`**, that is fine too.
+
+Do **not** paste the “JSON” view of the URL (e.g. an object with `"scheme"`, `"host"`, `"query"`). That is not valid input.
+
+### 6. Run the setup command and paste
+
+From the **same folder** where you want `browser.json` created (usually the repo root):
+
+```bash
+uv run ytmusicapi browser
+```
+
+When prompted, **paste** the full header block, then finish input:
+
+- **Linux / macOS:** `Ctrl+D` on an empty line.
+- **Windows (cmd):** `Ctrl+Z` then Enter (see the on-screen hint from `ytmusicapi` if it differs).
+
+You should get **`browser.json`** in that directory. You can pass a different file with **`--auth`** on inventory/delete.
+
+Optional: **`uv run ytmusicapi browser --file /path/to/my-auth.json`** to write somewhere else.
+
+Official reference: [ytmusicapi setup](https://ytmusicapi.readthedocs.io/en/stable/usage/setup.html).
+
+---
+
+## Everyday usage
+
+Run commands from the project directory (or pass full paths to `--auth` / `--in` / `--out`).
+
+### Step 1 — Download your artist list (read-only)
 
 ```bash
 uv run python ytm_purge.py inventory --out artists.csv
 ```
 
-Optional: `--auth /path/to/browser.json` (default: `browser.json` in the current working directory).
+Uses `browser.json` in the current directory by default. Elsewhere:
 
-Writes `artists.csv` with columns:
+```bash
+uv run python ytm_purge.py inventory --auth /path/to/browser.json --out artists.csv
+```
 
-| column        | description                                                       |
-| ------------- | ----------------------------------------------------------------- |
-| `delete`      | empty by default; set to `1` to mark for deletion                 |
-| `name`        | artist display name as reported by the API                        |
-| `channel_id`  | YouTube channel ID — the canonical key                            |
-| `songs`       | count of saved-library songs by this artist                       |
-| `liked`       | count of liked songs (separate store from saved library)          |
-| `albums`      | count of saved albums                                             |
-| `subscribed`  | `1` if the user subscribes to the artist channel                  |
+### Step 2 — Build your keep list
 
-### 2. Edit
+Open **`artists.csv`** in LibreOffice, Excel, Numbers, or a text editor. **Delete entire rows** for every artist you want **removed** from YouTube Music. Leave only rows for artists you want to **keep**. Keep the **header** line intact.
 
-Open `artists.csv` in any tool that round-trips CSV cleanly (LibreOffice Calc, Numbers, Excel with care, vim, etc.). Filter or sort as desired and set `delete=1` on the rows to be removed. Truthy values accepted by the parser: `1`, `x`, `X`, `y`, `Y`, `yes`, `true` (case-insensitive variants). Anything else — including blank — is treated as keep.
+Do not strip or hand-edit **`channel_id`** on rows you keep — that column is how the next step matches your file to the live library.
 
-### 3. Delete
+### Step 3 — Preview, then run deletion
+
+**Always preview first** (no changes to your library):
 
 ```bash
 uv run python ytm_purge.py delete --in artists.csv --dry-run
 ```
 
-Optional: `--auth` as above.
+Review the printed counts and sample tracks. Then run without `--dry-run`. You will get a **`Proceed? [y/N]`** prompt before anything is deleted.
 
-Prints a summary:
+After you confirm, the script prints **clear sections** (saved library, Liked Music, albums, subscriptions) and ends with a **`Run summary`** so you can see what succeeded vs what still needs manual cleanup — especially when library removal fails for some tracks.
 
+**How `delete` decides:** it **fetches your library again** (same idea as **`inventory`**), builds the set of artist channel IDs currently present, and **removes** every artist that is **not** listed in your CSV **`channel_id`** column. There is **no separate snapshot file**.
+
+**Numbers in the plan are live:** counts come from a fresh YouTube fetch. After a run removes items, the next plan is usually smaller. (Older behaviour used `rate_song` for likes, which often **left rows in Liked Music**; current versions remove LM entries via the **Liked Music playlist (`LM`)** when `setVideoId` is present.)
+
+**Liked Music vs saved library:** If you only thumbs-up tracks, **remove from library** is often **0**; watch the **Liked Music** line. Library-token issues apply only to explicitly **saved** songs. If you don’t change the account elsewhere during a run, the plan you confirmed is what that run processes.
+
+**Important:** If you **add** music after editing the CSV but **do not** add those artists’ rows (with correct `channel_id`) to the file, the next **`delete`** run can treat them as “missing from the keep list” and remove them. Run **`inventory`** again and merge new rows if you need an up-to-date keep list.
+
+---
+
+## CSV columns (inventory output)
+
+| Column | Meaning |
+|--------|--------|
+| `name` | Artist name from YouTube (for your eyes only). |
+| `channel_id` | Internal ID used for matching — do not edit unless you know what you are doing. |
+| `songs` | Saved-to-library track count for this artist. |
+| `liked` | Liked-track count (Liked Music is separate from “saved to library”). |
+| `albums` | Saved album count. |
+| `subscribed` | `1` if you follow that artist channel. |
+
+Rows are sorted so artists with more library activity appear first.
+
+---
+
+## Troubleshooting
+
+| Problem | What to try |
+|--------|----------------|
+| **Network tab is empty** | Open **Network** *before* reloading **music.youtube.com**; hard-reload (`Ctrl+Shift+R`); clear any text in the filter box. |
+| **`ytmusicapi browser` says headers are missing** | Use another request (e.g. **`youtubei`** **POST**), ensure you are logged in, and use **Copy Request Headers**, not URL JSON. |
+| **`InvalidHeader` or garbage in the error mentioning `POST /...`** | You accidentally stored a full request line as a header name. Delete `browser.json` and repeat [setup](#one-time-setup-sign-in-and-create-browserjson); use a **youtubei** request and **Copy Request Headers** only. Current versions of `ytm_purge` also drop invalid header keys when loading `browser.json`. |
+| **OAuth / credentials error from `ytmusicapi`** | Usually means the JSON was not recognised as browser session headers. Regenerate from a logged-in **music.youtube.com** request as above. |
+| **Session expired later** | Create a fresh `browser.json` the same way. |
+| **Plan lists library songs but none are “Removed … from library”** | YouTube sometimes omits remove tokens on the library list. Current builds refetch tokens via the track’s watch playlist; if you still see warnings, remove those titles manually in the app. |
+| **Same CSV, but unlike / library counts changed on the next run** | Normal. Each run (and `--dry-run`) refetches **current** Liked Music / library state. After tracks are unliked or removed, the next plan has **fewer** rows to act on. |
+
+---
+
+## What this tool does *not* do
+
+- **Watch history.** The recommender can still suggest artists you used to play until you clear **YouTube Music** activity under [Google My Activity](https://myactivity.google.com). Your **library** and **library shuffle** can still be cleaned by this tool.
+- **“Don’t recommend channel”.** That is separate from unsubscribing; you may still do it manually in the app.
+- **Your own playlists.** Tracks only in user-made playlists are **not** removed (only library / likes / saved albums / subscriptions as described above).
+
+---
+
+## Safety notes
+
+- **`inventory`** only **reads** your library; it does not delete anything.
+- **`delete --dry-run`** only **reads** your library and your CSV, then prints a plan.
+- **`delete`** without `--dry-run` asks for **`y`** before changing anything.
+- An **empty** CSV (no data rows with a `channel_id`) is **rejected**: it would mean removing **every** artist in the library.
+- Re-running **`delete`** with the same keep list is intended to be safe if something failed partway (operations are idempotent where the API allows).
+
+---
+
+## For contributors
+
+If you are hacking on the script itself:
+
+```bash
+uv sync --all-groups
+uv run pytest
+uv run ruff check .
 ```
-Plan:
-  artists targeted:        12
-  remove from library:     147 songs
-  unlike (Liked Music):    23 songs
-  remove saved albums:     8
-  unsubscribe artists:     12
 
-First 10 songs to remove from library:
-    - <title> — <artists>
-    ...
+The repo includes [`.vscode/launch.json`](.vscode/launch.json) examples for debugging **inventory** and **delete --dry-run**; put **`browser.json`** in the workspace folder when using them.
 
-[dry-run] no changes made.
-```
-
-If the plan is correct, drop `--dry-run` and re-run; the script will print the same summary and prompt for `y/N` confirmation before executing.
-
-## Developing & debugging
-
-- After `uv sync --all-groups`, use `.venv/bin/python` (or **Python: Select Interpreter** in the editor) so breakpoints resolve.
-- [`.vscode/launch.json`](.vscode/launch.json) includes launch configurations for `inventory` and `delete --dry-run` with `cwd` set to the workspace; ensure `browser.json` exists in that directory when hitting the live API.
-- Run tests and lint:
-
-  ```bash
-  uv run pytest
-  uv run ruff check .
-  ```
-
-Tests cover CSV parsing and artist matching only; they do not call YouTube Music.
-
-## Architecture
-
-The script is a single Python file, `ytm_purge.py`, organised into four functional layers:
-
-### Aggregation: `collect_artists`
-
-Walks each library-state endpoint exposed by `ytmusicapi` —
-
-- `get_library_songs` — songs the user has explicitly saved to library;
-- `get_liked_songs` — tracks in the *Liked Music* playlist (a separate store; a saved library song is not necessarily liked, and vice versa);
-- `get_library_albums` — saved albums;
-- `get_library_subscriptions` — followed artist channels;
-
-— and folds them into a `dict[channel_id, {name, songs, liked, albums, subscribed}]`. The artist channel ID is the canonical key throughout; display names are recorded for human inspection only and are never used for matching.
-
-### Serialisation: `write_csv`
-
-Sorts the aggregated dict by `songs + liked + albums` descending and writes the CSV.
-
-### Marking input: `read_marked`
-
-Reads the CSV with `utf-8-sig` to tolerate BOMs introduced by Windows-side editors, and returns the subset of rows whose `delete` cell matches the truthy set.
-
-### Mutation: `delete_artists`
-
-Re-fetches current library state at run time (a deliberate choice — the inventory CSV may be hours or days old, and individual `videoId`/`feedbackToken` values are session-scoped), computes the intersection with the target channel-ID set, prints a plan, and on confirmation:
-
-1. Batches all `feedbackTokens.remove` tokens into a single `edit_song_library_status` call (the API accepts a list).
-2. Iterates `rate_song(videoId, 'INDIFFERENT')` over the like set (one call per track; the endpoint is cheap and not batchable).
-3. Iterates `rate_playlist(browseId, 'INDIFFERENT')` over the album set.
-4. Calls `unsubscribe_artists(target_ids)` once.
-
-Errors are logged per-item to stderr and do not abort the run; partial completion is preferred over rollback because the operations are individually idempotent (re-running with the same CSV is safe).
-
-### CLI: `main`
-
-Standard `argparse` with two subcommands, `inventory` and `delete`. Shared options: `--auth` (default `browser.json`). The inventory/delete page-size limit is hard-coded at 10,000, which exceeds any plausible personal-library size.
-
-## Working on this repo with Claude Code
-
-A few notes for Claude Code or other agentic tooling picking this up:
-
-- **Single-file by design.** Resist splitting into modules unless the codebase grows materially. The four functional layers above are organised as plain functions in dependency order in `ytm_purge.py`.
-- **Idempotency is a load-bearing invariant.** Any new mutation should be safe to re-run with the same input CSV. Avoid introducing operations that fail on already-applied state without catching the corresponding exception.
-- **Channel ID, not name.** All matching is on `channel_id`. Display-name matching has been considered and deliberately rejected (homonyms, transliteration variants, Unicode normalisation hazards).
-- **Read-state freshness.** `delete_artists` re-fetches library state at run time rather than trusting the inventory CSV. Preserve this when refactoring; inventory data is for human review only.
-- **Error handling: log, continue.** Per-item failures during the mutation phase are logged to stderr and do not abort. The user can re-run with the same CSV to retry.
-
-## Non-goals
-
-The following are explicitly out of scope for this tool:
-
-- **Watch history pruning.** YouTube Music's recommender (home feed, station radio, autoplay) is conditioned on watch history independently of library state. Until the user prunes history at [myactivity.google.com](https://myactivity.google.com) filtered to YouTube Music, removed artists may continue to appear in radio extensions. *Library shuffle itself* will be clean immediately after a run.
-- **The `Don't recommend channel` signal.** This is a distinct endpoint from artist unsubscription. `ytmusicapi` does not currently expose a stable wrapper, and it is the one step best done by hand on the artist page.
-- **User-created playlists.** Tracks in user-curated playlists are untouched. Adding this is straightforward (`get_library_playlists` → `get_playlist` → `remove_playlist_items` per matching track) but has not been needed in practice; library shuffle does not draw from custom playlists.
-
-## Possible extensions
-
-Listed roughly in order of plausible utility:
-
-- A `playlists` subcommand that scrubs target artists from user-created playlists.
-- A `history` subcommand calling `remove_history_items`. The Activity-controls UI is more thorough but a programmatic option would close the loop within the script.
-- Persisting a deletion log (CSV or JSONL) of `(timestamp, artist_id, action, target_id, status)` for auditability and possible undo.
-- A `--from-list` mode that takes a plain text file of channel IDs or artist names rather than a marked CSV, for use when the target set is known *a priori* (e.g. exported from another source).
+---
 
 ## License
 
-Author's choice. MIT is suggested as a permissive default for tooling of this kind.
+Author’s choice. MIT is a reasonable default for small tooling.
 
 ## Acknowledgements
 
-- [`ytmusicapi`](https://github.com/sigma67/ytmusicapi) by sigma67 — the unofficial Python client that does all the actual work of speaking to YouTube Music.
-- [`ytmusic-deleter`](https://github.com/apastel/ytmusic-deleter) by apastel — a more general-purpose batch-delete tool for YouTube Music libraries; consulted as prior art.
+- **[ytmusicapi](https://github.com/sigma67/ytmusicapi)** — unofficial Python client for YouTube Music.
+- **[ytmusic-deleter](https://github.com/apastel/ytmusic-deleter)** — related batch-delete tool, consulted as prior art.
