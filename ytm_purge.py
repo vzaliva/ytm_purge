@@ -5,8 +5,8 @@ ytm_purge.py — semi-automated artist-level purge of a YouTube Music library.
 Workflow
 --------
 1.  uv run python ytm_purge.py inventory [--auth browser.json] --out artists.csv
-        Writes one row per artist in your library (songs, likes, albums,
-        subscriptions), sorted by footprint.
+        Writes one row per artist in your library (streaming songs, likes, albums,
+        subscriptions, uploaded songs, uploaded albums), sorted by footprint.
 
 2.  Edit artists.csv: delete entire rows for artists you do **not** want to keep.
         The remaining file is your **keep list** (do not remove the header row).
@@ -14,7 +14,8 @@ Workflow
 3.  uv run python ytm_purge.py delete [--auth browser.json] --in artists.csv [--dry-run]
         Re-scans your library like inventory. Every artist **present in the
         library** whose channel_id is **not** listed in the CSV is purged:
-        library songs, likes, saved albums, and channel unsubscribe.
+        streaming library songs, **uploaded songs** (removed from the cloud
+        permanently), likes, saved albums, and channel unsubscribe.
         Use --dry-run first. Artists added to the library after you edited
         the CSV but not added to the file will also be purged — refresh the
         CSV or merge new channel_ids if you intend to keep them.
@@ -28,6 +29,8 @@ https://ytmusicapi.readthedocs.io/en/stable/usage/setup.html
 Caveats
 -------
 - Does not touch user-created playlists. Trivial to add if needed.
+- ``delete`` removes **uploaded** tracks via ``music/delete_privately_owned_entity``
+  (same as the app’s delete upload); that cannot be undone from this tool.
 - Does not prune watch history (recommendations / radio still draw on
   it). Use myactivity.google.com filtered to YouTube Music for that.
 """
@@ -44,6 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from ytmusicapi import YTMusic
+from ytmusicapi.enums import ResponseStatus
 from ytmusicapi.continuations import CONTINUATION_ITEMS, get_continuation_token
 from ytmusicapi.navigation import CONTENT, SECTION, TWO_COLUMN_RENDERER, nav
 
@@ -80,13 +84,19 @@ def ytmusic_from_auth(auth: str) -> YTMusic:
 
 
 def collect_artists(yt: YTMusic) -> dict[str, dict]:
-    """Aggregate every artist channel touching the library."""
+    """Aggregate every artist touching the library (streaming + uploads).
+
+    Upload artists use YouTube Music browse ids (e.g.
+    ``FEmusic_library_privately_owned_artist_detail…``), not channel ``UC…`` ids.
+    """
     idx: dict[str, dict] = defaultdict(lambda: {
         "name": None,
         "songs": 0,
         "liked": 0,
         "albums": 0,
         "subscribed": False,
+        "uploads": 0,
+        "upload_albums": 0,
     })
 
     def bump(cid: str | None, name: str | None, key: str) -> None:
@@ -114,18 +124,40 @@ def collect_artists(yt: YTMusic) -> dict[str, dict]:
             idx[cid]["name"] = a.get("artist") or idx[cid]["name"]
             idx[cid]["subscribed"] = True
 
+    for s in yt.get_library_upload_songs(limit=None) or []:
+        for a in s.get("artists") or []:
+            bump(a.get("id"), a.get("name"), "uploads")
+
+    for alb in yt.get_library_upload_albums(limit=None) or []:
+        for a in alb.get("artists") or []:
+            bump(a.get("id"), a.get("name"), "upload_albums")
+
     return idx
 
 
 def write_csv(idx: dict[str, dict], path: str) -> None:
-    rows = sorted(
-        idx.items(),
-        key=lambda kv: kv[1]["songs"] + kv[1]["liked"] + kv[1]["albums"],
-        reverse=True,
-    )
+    def footprint(m: dict) -> int:
+        return (
+            m["songs"]
+            + m["liked"]
+            + m["albums"]
+            + m["uploads"]
+            + m["upload_albums"]
+        )
+
+    rows = sorted(idx.items(), key=lambda kv: footprint(kv[1]), reverse=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["name", "channel_id", "songs", "liked", "albums", "subscribed"])
+        w.writerow([
+            "name",
+            "channel_id",
+            "songs",
+            "liked",
+            "albums",
+            "subscribed",
+            "uploads",
+            "upload_albums",
+        ])
         for cid, m in rows:
             w.writerow([
                 m["name"] or "",
@@ -134,6 +166,8 @@ def write_csv(idx: dict[str, dict], path: str) -> None:
                 m["liked"],
                 m["albums"],
                 int(m["subscribed"]),
+                m["uploads"],
+                m["upload_albums"],
             ])
 
 
@@ -168,7 +202,12 @@ LM_REMOVE_CHUNK = 50
 
 
 def matches(track: dict, target_ids: set[str]) -> bool:
+    """True if any artist ``id`` on a song, album, or upload row is in ``target_ids``."""
     return any((a.get("id") in target_ids) for a in (track.get("artists") or []))
+
+
+def _upload_delete_succeeded(result: Any) -> bool:
+    return result == ResponseStatus.SUCCEEDED
 
 
 def _dedupe_liked_tracks(tracks: list[dict]) -> list[dict]:
@@ -463,6 +502,8 @@ def delete_artists(yt: YTMusic, target_ids: set[str], dry_run: bool, debug: bool
         return
 
     library_songs = yt.get_library_songs(limit=10_000) or []
+    upload_songs = yt.get_library_upload_songs(limit=None) or []
+    uploads_to_delete = [s for s in upload_songs if matches(s, target_ids)]
     likes_raw = _dedupe_liked_tracks(
         (yt.get_liked_songs(limit=None) or {}).get("tracks", [])
     )
@@ -492,6 +533,10 @@ def delete_artists(yt: YTMusic, target_ids: set[str], dry_run: bool, debug: bool
                 "unlike uses rate_song, trying watch-playlist id variants per track)"
             )
     print(f"  remove saved albums:     {len(albums_to_unsave)}")
+    print(
+        f"  delete uploads:          {len(uploads_to_delete)} song(s) "
+        "(permanent; music/delete_privately_owned_entity)"
+    )
     print(f"  unsubscribe channels:    {len(unsub_targets)} subscribed (others need no unsubscribe)")
     print()
     if songs_to_unsave:
@@ -504,6 +549,16 @@ def delete_artists(yt: YTMusic, target_ids: set[str], dry_run: bool, debug: bool
         for s in songs_to_unsave[:10]:
             artists = ", ".join(a.get("name", "") for a in (s.get("artists") or []))
             print(f"    - {s.get('title')} — {artists}")
+    if uploads_to_delete:
+        n_u = len(uploads_to_delete)
+        u_prev = min(10, n_u)
+        print(
+            f"\nPreview: first {u_prev} of {n_u} uploaded song(s) to delete permanently "
+            "(not a separate approval step):"
+        )
+        for s in uploads_to_delete[:10]:
+            artists = ", ".join(a.get("name", "") for a in (s.get("artists") or []))
+            print(f"    - {s.get('title')} — {artists}")
     if debug:
         _debug_print_delete_snapshot(yt, songs_to_unsave, likes_to_unlike)
     if dry_run:
@@ -511,7 +566,8 @@ def delete_artists(yt: YTMusic, target_ids: set[str], dry_run: bool, debug: bool
         return
 
     print(
-        "\nOne confirmation applies to the whole plan: library, Liked Music, "
+        "\nOne confirmation applies to the whole plan: streaming library, "
+        "**uploads (permanent file delete in your YTM cloud library)**, Liked Music, "
         "saved albums, and subscription cancels."
     )
     if input("\nProceed with full plan? [y/N] ").strip().lower() != "y":
@@ -549,6 +605,49 @@ def delete_artists(yt: YTMusic, target_ids: set[str], dry_run: bool, debug: bool
         )
         for s in library_no_token[:10]:
             print(f"      · {s.get('title')}", file=sys.stderr)
+
+    upload_removed = 0
+    upload_skipped = 0
+    upload_fail = 0
+
+    print("\n--- Uploads ---")
+    if not uploads_to_delete:
+        print("No matching uploaded songs to delete.")
+    else:
+        print(
+            f"Deleting {len(uploads_to_delete)} uploaded song(s) "
+            "(permanent; cannot be undone here)…",
+            flush=True,
+        )
+        for s in uploads_to_delete:
+            eid = s.get("entityId")
+            if not eid:
+                upload_skipped += 1
+                print(
+                    f"  ! skip (no entityId): {s.get('title')}",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                res = yt.delete_upload_entity(str(eid))
+                if _upload_delete_succeeded(res):
+                    upload_removed += 1
+                else:
+                    upload_fail += 1
+                    print(
+                        f"  ! upload delete failed for {s.get('title')}: {res!r}",
+                        file=sys.stderr,
+                    )
+            except Exception as e:
+                upload_fail += 1
+                print(
+                    f"  ! upload delete error for {s.get('title')}: {e}",
+                    file=sys.stderr,
+                )
+        print(
+            f"Uploads result: {upload_removed} removed; "
+            f"{upload_skipped} skipped (no entityId); {upload_fail} error(s)."
+        )
 
     lm_removed_ok = 0
     lm_playlist_err = 0
@@ -686,6 +785,11 @@ def delete_artists(yt: YTMusic, target_ids: set[str], dry_run: bool, debug: bool
         )
     else:
         print("  Liked Music: no matching tracks")
+    print(
+        f"  Uploads: {upload_removed} deleted; "
+        f"{upload_skipped} skipped; {upload_fail} failed "
+        f"(of {len(uploads_to_delete)} planned)"
+    )
     print(
         f"  Saved albums: {albums_removed} removed "
         f"(of {len(albums_to_unsave)} planned)"

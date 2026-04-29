@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 import ytm_purge
+from ytmusicapi.enums import ResponseStatus
 
 
 def test_coerce_browser_auth_adds_sapisid_placeholder_when_missing() -> None:
@@ -289,3 +290,48 @@ def test_rate_song_video_id_candidates_watch_error_keeps_primary() -> None:
             raise RuntimeError("network")
 
     assert ytm_purge._rate_song_video_id_candidates(_Yt(), "x") == ["x"]
+
+
+def test_matches_upload_artist_browse_id() -> None:
+    bid = "FEmusic_library_privately_owned_artist_detaila_po_x"
+    track = {"artists": [{"name": "Self", "id": bid}]}
+    assert ytm_purge.matches(track, {bid})
+    assert not ytm_purge.matches(track, {"UCother"})
+
+
+def test_upload_delete_succeeded() -> None:
+    assert ytm_purge._upload_delete_succeeded(ResponseStatus.SUCCEEDED)
+    assert not ytm_purge._upload_delete_succeeded("server error")
+
+
+def test_collect_artists_counts_uploads_and_upload_albums() -> None:
+    class _Yt:
+        def get_library_songs(self, limit=25):
+            return []
+
+        def get_liked_songs(self, limit=100):
+            return {"tracks": []}
+
+        def get_library_albums(self, limit=25):
+            return []
+
+        def get_library_subscriptions(self, limit=25):
+            return []
+
+        def get_library_upload_songs(self, limit=25):
+            return [
+                {"title": "A", "artists": [{"id": "FEu1", "name": "U"}]},
+            ]
+
+        def get_library_upload_albums(self, limit=25):
+            return [
+                {
+                    "title": "Home",
+                    "browseId": "FEmusic_library_privately_owned_release_detailb_x",
+                    "artists": [{"id": "FEu1", "name": "U"}],
+                },
+            ]
+
+    idx = ytm_purge.collect_artists(_Yt())
+    assert idx["FEu1"]["uploads"] == 1
+    assert idx["FEu1"]["upload_albums"] == 1

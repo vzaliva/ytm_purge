@@ -1,6 +1,6 @@
 # ytm-purge
 
-Command-line helper to **clean up your YouTube Music library by artist**: export every artist that appears in your library (saved songs, likes, saved albums, subscriptions), **delete the rows** for anyone you do **not** want to keep, then one command removes everyone else still in the library from your account (matching tracks, likes, saved albums, and artist subscriptions).
+Command-line helper to **clean up your YouTube Music library by artist**: export every artist that appears in your library (saved streaming songs, likes, saved streaming albums, subscriptions, **uploaded songs and upload-album rows**), **delete the rows** for anyone you do **not** want to keep, then one command removes everyone else still in your account (matching streaming saves, **uploads** — removed permanently from your YTM cloud library — likes, saved albums, and artist subscriptions).
 
 You build a **keep list** by editing the CSV; the tool does not guess from language, country, or metadata — only who remains in the file.
 
@@ -118,7 +118,7 @@ uv run python ytm_purge.py inventory --auth /path/to/browser.json --out artists.
 
 Open **`artists.csv`** in LibreOffice, Excel, Numbers, or a text editor. **Delete entire rows** for every artist you want **removed** from YouTube Music. Leave only rows for artists you want to **keep**. Keep the **header** line intact.
 
-Do not strip or hand-edit **`channel_id`** on rows you keep — that column is how the next step matches your file to the live library.
+Do not strip or hand-edit **`channel_id`** on rows you keep — that column is how the next step matches your file to the live library. For **upload** artists, `channel_id` is a YouTube Music browse id (typically starting with `FEmusic_library_privately_owned_artist_detail…`), not a `UC…` channel id.
 
 ### Step 3 — Preview, then run deletion
 
@@ -128,11 +128,11 @@ Do not strip or hand-edit **`channel_id`** on rows you keep — that column is h
 uv run python ytm_purge.py delete --in artists.csv --dry-run
 ```
 
-Review the printed counts and sample tracks. Then run without `--dry-run`. You will get a **`Proceed? [y/N]`** prompt before anything is deleted.
+Review the printed counts and sample tracks. Then run without `--dry-run`. You will get a confirmation prompt before anything is deleted.
 
-After you confirm, the script prints **clear sections** (saved library, Liked Music, albums, subscriptions) and ends with a **`Run summary`** so you can see what succeeded vs what still needs manual cleanup — especially when library removal fails for some tracks.
+After you confirm, the script prints **clear sections** (streaming saved songs, **Uploads**, Liked Music, albums, subscriptions) and ends with a **`Run summary`** so you can see what succeeded vs what still needs manual cleanup — especially when library removal fails for some tracks.
 
-**How `delete` decides:** it **fetches your library again** (same idea as **`inventory`**), builds the set of artist channel IDs currently present, and **removes** every artist that is **not** listed in your CSV **`channel_id`** column. There is **no separate snapshot file**.
+**How `delete` decides:** it **fetches your library again** (same idea as **`inventory`**), builds the set of artist ids currently present (`UC…` for catalog artists, **plus** upload-artist browse ids), and **removes** every artist that is **not** listed in your CSV **`channel_id`** column. There is **no separate snapshot file**.
 
 **Numbers in the plan are live:** counts come from a fresh YouTube fetch. After a run removes items, the next plan is usually smaller. (Older behaviour used `rate_song` for likes, which often **left rows in Liked Music**; current versions remove LM entries via the **Liked Music playlist (`LM`)** when `setVideoId` is present.)
 
@@ -148,12 +148,14 @@ After you confirm, the script prints **clear sections** (saved library, Liked Mu
 |--------|--------|
 | `name` | Artist name from YouTube (for your eyes only). |
 | `channel_id` | Internal ID used for matching — do not edit unless you know what you are doing. |
-| `songs` | Saved-to-library track count for this artist. |
+| `songs` | Saved-to-library **streaming** track count for this artist. |
 | `liked` | Liked-track count (Liked Music is separate from “saved to library”). |
-| `albums` | Saved album count. |
-| `subscribed` | `1` if you follow that artist channel. |
+| `albums` | Saved **streaming** album count. |
+| `subscribed` | `1` if you follow that artist channel (`UC…`). |
+| `uploads` | **Uploaded** song count (Library → Uploads) attributed to this artist. |
+| `upload_albums` | Count of **upload-only** album grid entries for this artist. |
 
-Rows are sorted so artists with more library activity appear first.
+Rows are sorted so artists with more total footprint (including uploads) appear first.
 
 ---
 
@@ -175,7 +177,7 @@ Rows are sorted so artists with more library activity appear first.
 
 - **Watch history.** The recommender can still suggest artists you used to play until you clear **YouTube Music** activity under [Google My Activity](https://myactivity.google.com). Your **library** and **library shuffle** can still be cleaned by this tool.
 - **“Don’t recommend channel”.** That is separate from unsubscribing; you may still do it manually in the app.
-- **Your own playlists.** Tracks only in user-made playlists are **not** removed (only library / likes / saved albums / subscriptions as described above).
+- **Your own playlists.** Tracks only in user-made playlists are **not** removed. **`delete`** does remove matching **uploads**, streaming saves, likes, saved albums, and subscriptions as described above.
 
 ---
 
@@ -184,6 +186,7 @@ Rows are sorted so artists with more library activity appear first.
 - **`inventory`** only **reads** your library; it does not delete anything.
 - **`delete --dry-run`** only **reads** your library and your CSV, then prints a plan.
 - **`delete`** without `--dry-run` asks for **`y`** before changing anything.
+- **Uploads:** confirmed runs call YouTube’s **`music/delete_privately_owned_entity`** for each matching uploaded song — those files are **removed from your YouTube Music cloud library** (not just hidden). Re-upload if you still need them.
 - An **empty** CSV (no data rows with a `channel_id`) is **rejected**: it would mean removing **every** artist in the library.
 - Re-running **`delete`** with the same keep list is intended to be safe if something failed partway (operations are idempotent where the API allows).
 
