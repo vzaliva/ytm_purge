@@ -4,7 +4,7 @@ ytm_purge.py — semi-automated artist-level purge of a YouTube Music library.
 
 Workflow
 --------
-1.  python ytm_purge.py inventory --out artists.csv
+1.  uv run python ytm_purge.py inventory [--auth browser.json] --out artists.csv
         Writes one row per artist that appears anywhere in your library,
         liked songs, saved albums, or subscriptions, sorted by total
         footprint. The `delete` column starts empty.
@@ -12,7 +12,7 @@ Workflow
 2.  Open artists.csv in your editor of choice (Excel, Numbers, vim, ...),
     set `delete` to `1` on rows you want expunged, save.
 
-3.  python ytm_purge.py delete --in artists.csv [--dry-run]
+3.  uv run python ytm_purge.py delete [--auth browser.json] --in artists.csv [--dry-run]
         For every row marked `delete=1`:
           - removes that artist's saved songs from your library
           - removes (unlikes) that artist's tracks in Liked Music
@@ -22,8 +22,8 @@ Workflow
 
 Auth
 ----
-Run `ytmusicapi browser` once and follow the prompts to create
-`browser.json` next to this script. See:
+Run `uv run ytmusicapi browser` once and follow the prompts to create
+`browser.json` (or pass another path via `--auth`). See:
 https://ytmusicapi.readthedocs.io/en/stable/usage/setup.html
 
 Caveats
@@ -31,27 +31,17 @@ Caveats
 - Does not touch user-created playlists. Trivial to add if needed.
 - Does not prune watch history (recommendations / radio still draw on
   it). Use myactivity.google.com filtered to YouTube Music for that.
-- A `has_cyrillic` column is included as a triage aid; filter on it
-  in your spreadsheet to bulk-review likely candidates first.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import re
 import sys
 from collections import defaultdict
 from typing import Iterable
 
 from ytmusicapi import YTMusic
-
-AUTH_FILE = "browser.json"
-CYRILLIC = re.compile(r"[\u0400-\u04FF]")
-
-
-def has_cyrillic(s: str | None) -> bool:
-    return bool(s and CYRILLIC.search(s))
 
 
 def collect_artists(yt: YTMusic) -> dict[str, dict]:
@@ -101,7 +91,7 @@ def write_csv(idx: dict[str, dict], path: str) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["delete", "name", "channel_id", "songs", "liked",
-                    "albums", "subscribed", "has_cyrillic"])
+                    "albums", "subscribed"])
         for cid, m in rows:
             w.writerow([
                 "",
@@ -111,7 +101,6 @@ def write_csv(idx: dict[str, dict], path: str) -> None:
                 m["liked"],
                 m["albums"],
                 int(m["subscribed"]),
-                int(has_cyrillic(m["name"])),
             ])
 
 
@@ -207,19 +196,25 @@ def delete_artists(yt: YTMusic, marked: Iterable[dict], dry_run: bool) -> None:
 
 
 def main() -> None:
+    auth_kw = {
+        "default": "browser.json",
+        "help": "path to ytmusicapi browser auth JSON",
+    }
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_inv = sub.add_parser("inventory", help="dump artists to CSV")
+    p_inv.add_argument("--auth", **auth_kw)
     p_inv.add_argument("--out", default="artists.csv")
 
     p_del = sub.add_parser("delete", help="process a hand-marked CSV")
+    p_del.add_argument("--auth", **auth_kw)
     p_del.add_argument("--in", dest="inp", default="artists.csv")
     p_del.add_argument("--dry-run", action="store_true")
 
     args = p.parse_args()
-    yt = YTMusic(AUTH_FILE)
+    yt = YTMusic(args.auth)
 
     if args.cmd == "inventory":
         idx = collect_artists(yt)
@@ -235,4 +230,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

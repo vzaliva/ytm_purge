@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "ytm_purge: inventory",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/ytm_purge.py",
+      "args": ["inventory", "--out", "artists.csv"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "ytm_purge: delete --dry-run",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/ytm_purge.py",
+      "args": ["delete", "--in", "artists.csv", "--dry-run"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

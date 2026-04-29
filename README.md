@@ -6,17 +6,9 @@ The project is deliberately scoped: it solves library hygiene, not recommendatio
 
 ## Motivation
 
-YouTube Music exposes no built-in mechanism to filter or batch-delete a library by artist origin, language, or any other categorical attribute. The official client supports only per-track or per-album operations through its overflow menu, which is intractable for libraries above a few dozen items.
+YouTube Music exposes no built-in mechanism to batch-delete a library by artist. The official client supports only per-track or per-album operations through its overflow menu, which is intractable for libraries above a few dozen items.
 
-The use case that motivated this tool is value-based curation — for example, filtering a library by language or artist origin for personal or political reasons — but the design is content-agnostic: any criterion the user can apply by hand to a flat CSV of artists is supported.
-
-The classification problem (*which artists to remove?*) is intentionally left to the human operator. Heuristics such as Cyrillic-script detection are surfaced as triage aids in the inventory output but do not drive decisions, because:
-
-- Cyrillic script is shared across many languages (Ukrainian, Belarusian, Bulgarian, Serbian, Kazakh, etc.);
-- Many artists publish under Latin-script names or in English regardless of origin;
-- Origin metadata in YouTube Music's API is unreliable and frequently absent.
-
-Hand-marking on a sorted CSV is, empirically, both faster and more accurate than any automated classifier the author was prepared to maintain.
+This tool exports every artist that touches your library into a single CSV; you mark rows to remove; the script applies those choices. *Which* artists to remove is entirely up to you — the program does not classify or filter by language, origin, or metadata.
 
 ## Approach
 
@@ -30,7 +22,7 @@ The workflow is a three-phase pipeline with the human in the loop between phases
    YT Music ──▶ artists.csv ──▶ artists.csv* ──▶ YT Music
 ```
 
-1. **Inventory.** The script enumerates every artist channel that appears anywhere across the user's library (saved songs, liked songs, saved albums, subscriptions), aggregates per-source counts, and writes one row per artist to a CSV. Rows are sorted by total footprint so heavy-tail artists surface first. A boolean `has_cyrillic` column is included as a triage convenience.
+1. **Inventory.** The script enumerates every artist channel that appears anywhere across the user's library (saved songs, liked songs, saved albums, subscriptions), aggregates per-source counts, and writes one row per artist to a CSV. Rows are sorted by total footprint so heavy-tail artists surface first.
 
 2. **Edit.** The user opens the CSV in any spreadsheet or text editor, sets the `delete` column to `1` on each artist to be expunged, and saves. No other column needs to be touched.
 
@@ -44,20 +36,22 @@ The workflow is a three-phase pipeline with the human in the loop between phases
 
 ## Prerequisites
 
-- Python 3.10 or later.
-- [`ytmusicapi`](https://ytmusicapi.readthedocs.io/) (unofficial; emulates the YouTube Music web client using the user's browser cookie):
+- [uv](https://docs.astral.sh/uv/) (manages Python and dependencies).
+- Clone or copy this repo, then from the project root:
 
   ```bash
-  pip install ytmusicapi
+  uv sync --all-groups
   ```
 
-- A browser-cookie authentication file. Generate it once with:
+  Production use only needs `uv sync` (installs `ytmusicapi` and the script’s runtime deps).
+
+- A browser-cookie authentication file for `ytmusicapi`. Generate it once with:
 
   ```bash
-  ytmusicapi browser
+  uv run ytmusicapi browser
   ```
 
-  and follow the prompts. This produces `browser.json` in the working directory, which the script reads at startup. See the [ytmusicapi setup docs](https://ytmusicapi.readthedocs.io/en/stable/usage/setup.html) for the cookie-extraction procedure.
+  Follow the prompts. This produces `browser.json` in the working directory by default; pass a different path with `--auth` on `inventory` / `delete` if you keep the file elsewhere. See the [ytmusicapi setup docs](https://ytmusicapi.readthedocs.io/en/stable/usage/setup.html).
 
   OAuth-based authentication is also supported by `ytmusicapi` but has been intermittent following recent changes to Google's OAuth client restrictions; browser-cookie auth is the recommended path at the time of writing.
 
@@ -66,8 +60,10 @@ The workflow is a three-phase pipeline with the human in the loop between phases
 ### 1. Inventory
 
 ```bash
-python ytm_purge.py inventory --out artists.csv
+uv run python ytm_purge.py inventory --out artists.csv
 ```
+
+Optional: `--auth /path/to/browser.json` (default: `browser.json` in the current working directory).
 
 Writes `artists.csv` with columns:
 
@@ -80,7 +76,6 @@ Writes `artists.csv` with columns:
 | `liked`       | count of liked songs (separate store from saved library)          |
 | `albums`      | count of saved albums                                             |
 | `subscribed`  | `1` if the user subscribes to the artist channel                  |
-| `has_cyrillic`| `1` if the artist name contains characters in U+0400–U+04FF       |
 
 ### 2. Edit
 
@@ -89,8 +84,10 @@ Open `artists.csv` in any tool that round-trips CSV cleanly (LibreOffice Calc, N
 ### 3. Delete
 
 ```bash
-python ytm_purge.py delete --in artists.csv --dry-run
+uv run python ytm_purge.py delete --in artists.csv --dry-run
 ```
+
+Optional: `--auth` as above.
 
 Prints a summary:
 
@@ -111,6 +108,19 @@ First 10 songs to remove from library:
 
 If the plan is correct, drop `--dry-run` and re-run; the script will print the same summary and prompt for `y/N` confirmation before executing.
 
+## Developing & debugging
+
+- After `uv sync --all-groups`, use `.venv/bin/python` (or **Python: Select Interpreter** in the editor) so breakpoints resolve.
+- [`.vscode/launch.json`](.vscode/launch.json) includes launch configurations for `inventory` and `delete --dry-run` with `cwd` set to the workspace; ensure `browser.json` exists in that directory when hitting the live API.
+- Run tests and lint:
+
+  ```bash
+  uv run pytest
+  uv run ruff check .
+  ```
+
+Tests cover CSV parsing and artist matching only; they do not call YouTube Music.
+
 ## Architecture
 
 The script is a single Python file, `ytm_purge.py`, organised into four functional layers:
@@ -128,7 +138,7 @@ Walks each library-state endpoint exposed by `ytmusicapi` —
 
 ### Serialisation: `write_csv`
 
-Sorts the aggregated dict by `songs + liked + albums` descending and writes the CSV. The `has_cyrillic` column is computed here from the cached `CYRILLIC` regex (`[\u0400-\u04FF]`).
+Sorts the aggregated dict by `songs + liked + albums` descending and writes the CSV.
 
 ### Marking input: `read_marked`
 
@@ -147,7 +157,7 @@ Errors are logged per-item to stderr and do not abort the run; partial completio
 
 ### CLI: `main`
 
-Standard `argparse` with two subcommands, `inventory` and `delete`. Configuration is intentionally minimal — `AUTH_FILE` is a module-level constant (`browser.json`) and the inventory page-size limit is hard-coded at 10,000, which exceeds any plausible personal-library size.
+Standard `argparse` with two subcommands, `inventory` and `delete`. Shared options: `--auth` (default `browser.json`). The inventory/delete page-size limit is hard-coded at 10,000, which exceeds any plausible personal-library size.
 
 ## Working on this repo with Claude Code
 
@@ -156,7 +166,6 @@ A few notes for Claude Code or other agentic tooling picking this up:
 - **Single-file by design.** Resist splitting into modules unless the codebase grows materially. The four functional layers above are organised as plain functions in dependency order in `ytm_purge.py`.
 - **Idempotency is a load-bearing invariant.** Any new mutation should be safe to re-run with the same input CSV. Avoid introducing operations that fail on already-applied state without catching the corresponding exception.
 - **Channel ID, not name.** All matching is on `channel_id`. Display-name matching has been considered and deliberately rejected (homonyms, transliteration variants, Unicode normalisation hazards).
-- **No automated origin classification.** The `has_cyrillic` column is a UI hint, not a decision input. Proposals to integrate MusicBrainz, language detection, or LLM-based classification should be raised in an issue first; the human-in-the-loop CSV is a feature, not a limitation.
 - **Read-state freshness.** `delete_artists` re-fetches library state at run time rather than trusting the inventory CSV. Preserve this when refactoring; inventory data is for human review only.
 - **Error handling: log, continue.** Per-item failures during the mutation phase are logged to stderr and do not abort. The user can re-run with the same CSV to retry.
 
@@ -167,7 +176,6 @@ The following are explicitly out of scope for this tool:
 - **Watch history pruning.** YouTube Music's recommender (home feed, station radio, autoplay) is conditioned on watch history independently of library state. Until the user prunes history at [myactivity.google.com](https://myactivity.google.com) filtered to YouTube Music, removed artists may continue to appear in radio extensions. *Library shuffle itself* will be clean immediately after a run.
 - **The `Don't recommend channel` signal.** This is a distinct endpoint from artist unsubscription. `ytmusicapi` does not currently expose a stable wrapper, and it is the one step best done by hand on the artist page.
 - **User-created playlists.** Tracks in user-curated playlists are untouched. Adding this is straightforward (`get_library_playlists` → `get_playlist` → `remove_playlist_items` per matching track) but has not been needed in practice; library shuffle does not draw from custom playlists.
-- **Origin classification.** As above — the human is the classifier.
 
 ## Possible extensions
 
@@ -186,4 +194,3 @@ Author's choice. MIT is suggested as a permissive default for tooling of this ki
 
 - [`ytmusicapi`](https://github.com/sigma67/ytmusicapi) by sigma67 — the unofficial Python client that does all the actual work of speaking to YouTube Music.
 - [`ytmusic-deleter`](https://github.com/apastel/ytmusic-deleter) by apastel — a more general-purpose batch-delete tool for YouTube Music libraries; consulted as prior art.
-
